@@ -86,6 +86,8 @@ To replay the spend from scratch, delete `.demo-state.json` **and** start from a
 
 If the demo customer has no payment method, the Pro upgrade cannot complete: `billing.attach` returns a **payment URL** instead of an invoice. The script prints it — open it, pay with a Stripe test card (e.g. `4242 4242 4242 4242`), then run the script again; it picks up at the upgrade instead of starting over.
 
+Exit codes match completion: a run that stops early — the step-2 `check` denies the spend, or the upgrade is waiting on the payment above — exits non-zero. Only a run that completes every step (or finds every step already done) exits 0.
+
 ## Troubleshooting
 
 - **`Scenario failed: ... Status 401`** — the key in `.env` is wrong, or belongs to a different environment. The scenario expects a sandbox secret key (`am_sk_test_...`) for the same organisation you pushed the config to.

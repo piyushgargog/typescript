@@ -452,6 +452,10 @@ async function main() {
 					"  from this step.",
 				].join("\n"),
 			);
+			// The scenario did not finish — steps 3 and 4 never ran —
+			// so the exit code must say so. Returning normally here
+			// would report success for a run that stopped halfway.
+			process.exitCode = 1;
 			return;
 		}
 
@@ -570,6 +574,13 @@ async function main() {
 					"  up where this one left off instead of starting over.",
 				].join("\n"),
 			);
+			// The upgrade has not happened yet — Autumn is waiting on
+			// the payment above — so this run did not finish the
+			// scenario. Exit non-zero instead of printing the "Done"
+			// summary and reporting success; the re-run after paying
+			// completes the upgrade and exits 0.
+			process.exitCode = 1;
+			return;
 		} else if (upgrade.invoice) {
 			console.log(
 				"  upgrade applied and charged — no payment action needed",
