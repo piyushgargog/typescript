@@ -29,16 +29,54 @@
  * identical call deducts twice — so each completed `track` step is
  * recorded in a local state file (.demo-state.json, gitignored) and
  * skipped on later runs; the plan steps are guarded by the customer's
- * live state instead. Those guards are application-level logic on
- * purpose: duplicate protection is your code's job, not the billing
- * provider's.
+ * live state instead. The state file is tied to the API key in use (it
+ * stores a hash of the key, never the key itself): run with a different
+ * sandbox's key and the recorded spend is ignored rather than applied to
+ * the wrong account. A state file that cannot be read or parsed stops
+ * the script with an error — guessing from corrupt state could record
+ * the spend twice. Those guards are application-level logic on purpose:
+ * duplicate protection is your code's job, not the billing provider's.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
 import { Autumn } from "autumn-js";
 
 import { credits as creditsFeature, pro, starter } from "../autumn.config.js";
+
+// Load .env from the example root if one exists. Done in code rather
+// than with Node's --env-file flags because those need Node 22.9+
+// (--env-file-if-exists), while this example otherwise runs on the Node
+// versions its dependencies support (atmn declares >= 16, and this
+// package pins @types/node 20). A value already present in the
+// environment always wins; .env only fills in what is missing.
+const ENV_URL = new URL("../.env", import.meta.url);
+try {
+	if (existsSync(ENV_URL)) {
+		for (const line of readFileSync(ENV_URL, "utf8").split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) continue;
+			const eq = trimmed.indexOf("=");
+			if (eq === -1) continue;
+			const name = trimmed.slice(0, eq).trim();
+			let value = trimmed.slice(eq + 1).trim();
+			if (
+				value.length >= 2 &&
+				((value.startsWith('"') && value.endsWith('"')) ||
+					(value.startsWith("'") && value.endsWith("'")))
+			) {
+				value = value.slice(1, -1);
+			}
+			if (name && process.env[name] === undefined) {
+				process.env[name] = value;
+			}
+		}
+	}
+} catch {
+	// An unreadable .env is not fatal: the key may be set inline, and if
+	// it is not, the missing-key guidance below explains what to do.
+}
 
 const secretKey = process.env.AUTUMN_SECRET_KEY;
 
@@ -124,6 +162,23 @@ function creditCostOf(featureId: string): number {
 const BASIC_CREDIT_COST = creditCostOf(BASIC_MODEL);
 const PREMIUM_CREDIT_COST = creditCostOf(PREMIUM_MODEL);
 
+// The spend maths below divides by the credit costs, so a config that
+// left a model unpriced (or priced it at zero) would corrupt it. Refuse
+// up front — before any API call — rather than narrate wrong numbers.
+if (BASIC_CREDIT_COST <= 0 || PREMIUM_CREDIT_COST <= 0) {
+	console.error(
+		[
+			"autumn.config.ts does not price both models in credits.",
+			"",
+			"The `credits` feature's creditSchema must give basic_model and",
+			"premium_model a credit cost above zero. Check the config with:",
+			"",
+			"  npm run verify:config",
+		].join("\n"),
+	);
+	process.exit(1);
+}
+
 function rolloverOf(plan: any) {
 	const itemDef = (plan?.items ?? []).find(
 		(it: any) => pickField(it, "featureId", "feature_id") === CREDITS,
@@ -142,24 +197,103 @@ const ROLLOVER_CAP: Record<string, number> = {
 // say whether the demo spend already happened in an earlier cycle. Each
 // completed `track` step is therefore recorded in a small state file
 // (gitignored) and consulted before tracking again.
+//
+// The state is loaded and validated before any API call, and it fails
+// closed: only a *missing* file means "first run". A file that cannot be
+// read or parsed stops the script, because silently starting over from
+// corrupt state could record the spend — and deduct the credits — twice.
+//
+// The state is also tied to the API key it was written under, via a
+// SHA-256 fingerprint of the key (never the key itself). The same
+// customer ID in a different sandbox is a different customer, and
+// recorded steps from another account must not suppress this account's
+// spend.
 const STATE_URL = new URL("../.demo-state.json", import.meta.url);
+const STATE_TMP_URL = new URL("../.demo-state.json.tmp", import.meta.url);
+const KEY_FINGERPRINT = createHash("sha256")
+	.update(secretKey)
+	.digest("hex")
+	.slice(0, 16);
 
-type DemoState = { customers: Record<string, Record<string, number>> };
+type DemoState = {
+	keyFingerprint?: string;
+	customers: Record<string, Record<string, number>>;
+};
+
+function stateError(problem: string): never {
+	console.error(
+		[
+			problem,
+			"",
+			".demo-state.json is this example's duplicate protection, so the",
+			"script stops instead of guessing: guessing wrong could record",
+			"the demo spend — and deduct the credits — a second time.",
+			"",
+			"To start over safely, delete .demo-state.json AND use a fresh",
+			"customer (or nuke the sandbox with `npx atmn nuke`). Deleting",
+			"it on its own, against a customer who already spent, will",
+			"re-track the spend.",
+		].join("\n"),
+	);
+	process.exit(1);
+}
 
 function loadState(): DemoState {
+	let raw: string;
 	try {
-		const parsed = JSON.parse(readFileSync(STATE_URL, "utf8"));
-		if (parsed && typeof parsed === "object" && parsed.customers) {
-			return parsed as DemoState;
+		raw = readFileSync(STATE_URL, "utf8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+			return { customers: {} };
 		}
-	} catch {
-		// Missing or unreadable state file — start empty.
+		return stateError(
+			`Could not read .demo-state.json (${(err as Error).message}).`,
+		);
 	}
-	return { customers: {} };
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return stateError(".demo-state.json is not valid JSON.");
+	}
+	if (
+		!parsed ||
+		typeof parsed !== "object" ||
+		typeof (parsed as DemoState).customers !== "object" ||
+		(parsed as DemoState).customers === null ||
+		Object.values((parsed as DemoState).customers).some(
+			(record) =>
+				!record ||
+				typeof record !== "object" ||
+				Object.values(record).some((v) => typeof v !== "number"),
+		)
+	) {
+		return stateError(".demo-state.json does not have the expected shape.");
+	}
+	return parsed as DemoState;
 }
 
 function saveState(state: DemoState) {
-	writeFileSync(STATE_URL, `${JSON.stringify(state, null, 2)}\n`);
+	state.keyFingerprint = KEY_FINGERPRINT;
+	// Write to a temp file and rename, so a crash mid-write cannot leave
+	// a truncated state file behind for the next run to trip over.
+	writeFileSync(STATE_TMP_URL, `${JSON.stringify(state, null, 2)}\n`);
+	renameSync(STATE_TMP_URL, STATE_URL);
+}
+
+const state = loadState();
+if (state.keyFingerprint !== KEY_FINGERPRINT) {
+	if (Object.keys(state.customers).length > 0) {
+		console.log(
+			"Note: .demo-state.json was written under a different Autumn" +
+				" key (a different sandbox or organisation), so its recorded" +
+				" spend does not apply here — starting the spend tracking" +
+				" fresh. Usage this customer already has under this key is" +
+				" still adopted from the live balance in step 2.",
+		);
+	}
+	state.customers = {};
+	state.keyFingerprint = KEY_FINGERPRINT;
 }
 
 function heading(step: string, title: string) {
@@ -235,39 +369,47 @@ async function main() {
 		"2",
 		`Spend credits: ${SPEND_BASIC} basic requests + ${SPEND_PREMIUM} premium requests`,
 	);
-	const state = loadState();
 	const steps = (state.customers[CUSTOMER_ID] ??= {});
 	const basicStep = `track:${BASIC_MODEL}`;
 	const premiumStep = `track:${PREMIUM_MODEL}`;
 
-	// First run against this customer: adopt any usage the current cycle
-	// already shows (e.g. from a run that pre-dates the state file) so it
-	// is not tracked twice. The spend lands basic-first, so the cycle's
-	// usage attributes unambiguously up to the full demo spend.
-	if (steps[basicStep] === undefined && steps[premiumStep] === undefined) {
-		const cycleUsage = customer.balances?.[CREDITS]?.usage ?? 0;
-		if (cycleUsage > 0) {
-			const basicDone = Math.min(
-				SPEND_BASIC,
-				Math.floor(
-					Math.min(cycleUsage, SPEND_BASIC * BASIC_CREDIT_COST) /
-						BASIC_CREDIT_COST,
-				),
+	// Reconcile the recorded steps with the usage the current cycle
+	// already shows, so usage that reached Autumn without being recorded
+	// locally is not tracked twice. That gap is small but real: a run
+	// can stop after a `track` call lands and before the state file is
+	// written, or the state file can pre-date a step. The spend always
+	// lands basic-first — this script tracks basic before premium in
+	// every run — so cycle usage attributes unambiguously: basic
+	// requests up to the full basic spend, then premium requests from
+	// what is left over, and only in whole premium requests.
+	const cycleUsage = customer.balances?.[CREDITS]?.usage ?? 0;
+	if (cycleUsage > 0) {
+		const basicFromUsage = Math.min(
+			SPEND_BASIC,
+			Math.floor(
+				Math.min(cycleUsage, SPEND_BASIC * BASIC_CREDIT_COST) /
+					BASIC_CREDIT_COST,
+			),
+		);
+		const usageAfterBasic = cycleUsage - SPEND_BASIC * BASIC_CREDIT_COST;
+		const premiumFromUsage =
+			usageAfterBasic > 0 && usageAfterBasic % PREMIUM_CREDIT_COST === 0
+				? Math.min(SPEND_PREMIUM, usageAfterBasic / PREMIUM_CREDIT_COST)
+				: 0;
+		let adopted = false;
+		if (basicFromUsage > (steps[basicStep] ?? 0)) {
+			steps[basicStep] = basicFromUsage;
+			adopted = true;
+		}
+		if (premiumFromUsage > (steps[premiumStep] ?? 0)) {
+			steps[premiumStep] = premiumFromUsage;
+			adopted = true;
+		}
+		if (adopted) {
+			saveState(state);
+			console.log(
+				`  adopted ${cycleUsage} credits of existing usage into .demo-state.json — it will not be tracked again`,
 			);
-			const premiumCredits =
-				cycleUsage - basicDone * BASIC_CREDIT_COST;
-			const premiumDone =
-				premiumCredits % PREMIUM_CREDIT_COST === 0
-					? Math.min(SPEND_PREMIUM, premiumCredits / PREMIUM_CREDIT_COST)
-					: 0;
-			if (basicDone > 0) steps[basicStep] = basicDone;
-			if (premiumDone > 0) steps[premiumStep] = premiumDone;
-			if (basicDone > 0 || premiumDone > 0) {
-				saveState(state);
-				console.log(
-					`  adopted ${cycleUsage} credits of existing usage into .demo-state.json — it will not be tracked again`,
-				);
-			}
 		}
 	}
 
@@ -279,61 +421,72 @@ async function main() {
 			"  demo spend already tracked in an earlier run (recorded in .demo-state.json) — skipping",
 		);
 	} else {
-		// Gate first, then track. You always pass the *underlying* feature;
-		// Autumn converts the usage to credits (the check response's
-		// `balances` map includes the linked credit system). If the gate
-		// denies the spend, nothing is tracked and nothing is recorded —
-		// fix the cause and re-run.
-		const gateFeature = premiumRemaining > 0 ? PREMIUM_MODEL : BASIC_MODEL;
-		const gateAmount =
-			premiumRemaining > 0 ? premiumRemaining : basicRemaining;
+		// Gate first, then track. The gate checks the *pool*: `check` on
+		// the credit system itself, with requiredBalance set to the
+		// total credits the remaining spend costs. Checking one metered
+		// feature instead would price only that feature's portion —
+		// requiredBalance is converted at that feature's credit cost —
+		// so a pass could still leave the other portion unaffordable.
+		// If the gate denies the spend, nothing is tracked, nothing is
+		// recorded, and the run stops before the paid upgrade: fix the
+		// cause and re-run.
+		const totalRemainingCredits =
+			basicRemaining * BASIC_CREDIT_COST +
+			premiumRemaining * PREMIUM_CREDIT_COST;
 		const gate = await autumn.check({
 			customerId: CUSTOMER_ID,
-			featureId: gateFeature,
-			requiredBalance: gateAmount, // can this customer afford the remaining spend?
+			featureId: CREDITS,
+			requiredBalance: totalRemainingCredits, // can this customer afford the whole remaining spend?
 		});
 		console.log(
-			`  check ${gateFeature} x${gateAmount} → allowed: ${gate.allowed}`,
+			`  check credits x${totalRemainingCredits} (${basicRemaining} basic + ${premiumRemaining} premium requests remaining) → allowed: ${gate.allowed}`,
 		);
 
 		if (!gate.allowed) {
 			console.log(
-				"  check denied the spend — skipping the track calls, so no usage is recorded against a denied gate",
+				[
+					"  check denied the spend — no usage was tracked and the",
+					"  upgrade was not attempted. Fix the cause (usually: top",
+					"  up the balance, or start from a fresh customer) and",
+					"  re-run; the recorded state makes the re-run resume",
+					"  from this step.",
+				].join("\n"),
 			);
-		} else {
-			// `async: false` applies the usage before responding, so the
-			// balances printed below are already up to date. Each step is
-			// recorded as soon as it lands, so a run that stops halfway
-			// resumes with only the remainder.
-			const tracked: string[] = [];
-			if (basicRemaining > 0) {
-				await autumn.track({
-					customerId: CUSTOMER_ID,
-					featureId: BASIC_MODEL,
-					value: basicRemaining,
-					async: false,
-				});
-				steps[basicStep] = SPEND_BASIC;
-				saveState(state);
-				tracked.push(
-					`${basicRemaining} basic (${basicRemaining * BASIC_CREDIT_COST} credits)`,
-				);
-			}
-			if (premiumRemaining > 0) {
-				await autumn.track({
-					customerId: CUSTOMER_ID,
-					featureId: PREMIUM_MODEL,
-					value: premiumRemaining,
-					async: false,
-				});
-				steps[premiumStep] = SPEND_PREMIUM;
-				saveState(state);
-				tracked.push(
-					`${premiumRemaining} premium (${premiumRemaining * PREMIUM_CREDIT_COST} credits)`,
-				);
-			}
-			console.log(`  tracked ${tracked.join(" + ")}`);
+			return;
 		}
+
+		// `async: false` applies the usage before responding, so the
+		// balances printed below are already up to date. Each step is
+		// recorded as soon as it lands, so a run that stops halfway
+		// resumes with only the remainder.
+		const tracked: string[] = [];
+		if (basicRemaining > 0) {
+			await autumn.track({
+				customerId: CUSTOMER_ID,
+				featureId: BASIC_MODEL,
+				value: basicRemaining,
+				async: false,
+			});
+			steps[basicStep] = SPEND_BASIC;
+			saveState(state);
+			tracked.push(
+				`${basicRemaining} basic (${basicRemaining * BASIC_CREDIT_COST} credits)`,
+			);
+		}
+		if (premiumRemaining > 0) {
+			await autumn.track({
+				customerId: CUSTOMER_ID,
+				featureId: PREMIUM_MODEL,
+				value: premiumRemaining,
+				async: false,
+			});
+			steps[premiumStep] = SPEND_PREMIUM;
+			saveState(state);
+			tracked.push(
+				`${premiumRemaining} premium (${premiumRemaining * PREMIUM_CREDIT_COST} credits)`,
+			);
+		}
+		console.log(`  tracked ${tracked.join(" + ")}`);
 	}
 	customer = await autumn.customers.get({ customerId: CUSTOMER_ID });
 	printCreditBalance("after usage", customer);
@@ -341,7 +494,11 @@ async function main() {
 	// ── Step 3 ──────────────────────────────────────────────────────────────
 	heading("3", "Rollover at the monthly reset");
 	const balanceNow = customer.balances?.[CREDITS];
-	const planNow = currentPlanIds(customer)[0] ?? STARTER;
+	// The rollover terms that apply at the reset are those of the plan
+	// the customer ends the cycle on; if two plans somehow both read as
+	// current, that is the paid one.
+	const planIdsNow = currentPlanIds(customer);
+	const planNow = planIdsNow.includes(PRO) ? PRO : (planIdsNow[0] ?? STARTER);
 	const cap = ROLLOVER_CAP[planNow] ?? 0;
 	const rolloverNow = rolloverOf(PLANS[planNow]);
 	const expiryLength = rolloverNow
@@ -370,6 +527,11 @@ async function main() {
 				"  locally and will not repeat — and the balance will show",
 				"  a `rollovers` breakdown with the carried-over amount.",
 			].join("\n"),
+		);
+	} else {
+		console.log(
+			"  no credit balance to read — if step 1 also found none, the" +
+				" config was not pushed yet (`npx atmn push`)",
 		);
 	}
 	printCreditBalance("before upgrade", customer);
@@ -411,6 +573,11 @@ async function main() {
 		} else if (upgrade.invoice) {
 			console.log(
 				"  upgrade applied and charged — no payment action needed",
+			);
+		} else {
+			console.log(
+				"  attach returned no invoice or payment URL — the balance" +
+					" below shows the resulting state",
 			);
 		}
 	}

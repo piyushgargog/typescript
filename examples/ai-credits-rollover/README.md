@@ -2,7 +2,7 @@
 
 A complete worked example of an AI app billing on [Autumn](https://useautumn.com): one shared credit pool, unused credits that **roll over** at the monthly reset, and a **mid-cycle upgrade** that charges for the plan change and carries the remaining balance over.
 
-On raw Stripe, each of these is a project of its own — new product/price IDs on every pricing change, webhook handlers to sync state, cron jobs to reset balances, and your own logic for what happens to unused credits when a customer changes plan mid-cycle. Here, the pricing is one config file, and the only calls that change anything are `billing.attach`, `check` and `track` — state is read back with `customers.get`.
+On raw Stripe, each of these is a project of its own — new product/price IDs on every pricing change, webhook handlers to sync state, cron jobs to reset balances, and your own logic for what happens to unused credits when a customer changes plan mid-cycle. Here, the pricing is one config file. The scenario creates its demo customer (`customers.getOrCreate`); after that, the calls that change billing state are `billing.attach` and `track`. `check` only asks whether a spend is allowed, and state is read back with `customers.get`.
 
 ## The setup
 
@@ -66,7 +66,7 @@ npm run typecheck       # tsc --noEmit, strict, against the published typings
 
 [`src/scenario.ts`](./src/scenario.ts) walks one customer through the three cases, printing the credit balance after each step:
 
-1. **Credit pool in action.** The customer starts on Starter, spends 40 basic requests (40 credits) and 6 premium requests (60 credits). Your code checks and tracks the *underlying features*; Autumn converts usage to credits. Expected balance after this step on a fresh customer: granted 200, used 100, remaining 100.
+1. **Credit pool in action.** The customer starts on Starter, spends 40 basic requests (40 credits) and 6 premium requests (60 credits). Your code gates on the pool itself — `check` against the credit system for the spend's total cost — then tracks the *underlying features*; Autumn converts usage to credits. Expected balance after this step on a fresh customer: granted 200, used 100, remaining 100.
 2. **Rollover.** Nothing to call — rollover is config, not code. When the cycle resets, Autumn grants the new cycle's credits and carries unused credits (up to the cap) over as a separate rollover balance, visible in the balance's `rollovers` breakdown. A script can't fast-forward a billing cycle, so the scenario prints the live balance, the reset date, and exactly how many of the current unused credits would roll over; re-run it after that date to see a real rollover entry.
 3. **Mid-cycle plan change.** The customer upgrades to Pro with one more `billing.attach` call, using `carryOverBalances` so the remaining credits — including any rolled-over ones — survive instead of being replaced by the new plan's grant. The script prints the invoice Autumn creates for the change (amount and status), so the charge for the remaining cycle time is observed, not assumed. (Per the SDK's `AttachParams` docs, upgrades apply immediately by default; downgrades are scheduled for the end of the cycle.)
 
@@ -79,6 +79,8 @@ Your code (the app): gating with `check`, recording usage with `track` — and d
 ## Re-running, and the payment step
 
 The script is safe to run repeatedly: plan steps are skipped when the customer's live state already reflects them, and each `track` step is skipped when it is recorded in `.demo-state.json`. A run that stops halfway resumes with only the remainder.
+
+The state file is tied to the key it was written under — it stores a SHA-256 fingerprint of the key, never the key itself — so recorded steps are ignored when you run with a different sandbox's key; usage that customer already has under the new key is adopted from the live balance instead. And if the state file is corrupt or unreadable, the script stops with an error rather than guessing: a wrong guess could record the spend twice.
 
 To replay the spend from scratch, delete `.demo-state.json` **and** start from a fresh customer (or nuke the sandbox with `npx atmn nuke`). Do not delete the state file on its own against a customer who has already spent: the state file is the duplicate protection, and without it the spend is tracked — and deducted — a second time.
 
