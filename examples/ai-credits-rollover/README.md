@@ -2,7 +2,7 @@
 
 A complete worked example of an AI app billing on [Autumn](https://useautumn.com): one shared credit pool, unused credits that **roll over** at the monthly reset, and a **mid-cycle upgrade** that charges for the plan change and carries the remaining balance over.
 
-On raw Stripe, each of these is a project of its own — new product/price IDs on every pricing change, webhook handlers to sync state, cron jobs to reset balances, and your own logic for what happens to unused credits when a customer changes plan mid-cycle. Here, the pricing is one config file, and the app code only ever calls `billing.attach`, `check` and `track`.
+On raw Stripe, each of these is a project of its own — new product/price IDs on every pricing change, webhook handlers to sync state, cron jobs to reset balances, and your own logic for what happens to unused credits when a customer changes plan mid-cycle. Here, the pricing is one config file, and the only calls that change anything are `billing.attach`, `check` and `track` — state is read back with `customers.get`.
 
 ## The setup
 
@@ -74,11 +74,13 @@ npm run typecheck       # tsc --noEmit, strict, against the published typings
 
 Autumn (the provider): metering conversion into credits, balance resets and rollovers, the plan swap and its invoice.
 
-Your code (the app): gating with `check`, recording usage with `track` — and duplicate protection. **`track` has no idempotency key: call it twice and you deduct twice.** The scenario therefore reads the customer's state before every mutating step and skips work that is already done, which is also what makes it safe to re-run (next section). Treat that guard as part of the pattern, not scaffolding.
+Your code (the app): gating with `check`, recording usage with `track` — and duplicate protection. **`track` has no idempotency key: call it twice and you deduct twice.** Balance `usage` cannot serve as the guard either: it is scoped to the current billing cycle, so after a reset it reads zero even though the spend already happened. The scenario therefore guards the plan steps with the customer's live state and records each completed `track` step in a local state file (`.demo-state.json`, gitignored), which is also what makes it safe to re-run (next section). Treat that state file as part of the pattern, not scaffolding.
 
 ## Re-running, and the payment step
 
-The script is safe to run repeatedly: steps already reflected in the customer's state are skipped and reported.
+The script is safe to run repeatedly: plan steps are skipped when the customer's live state already reflects them, and each `track` step is skipped when it is recorded in `.demo-state.json`. A run that stops halfway resumes with only the remainder.
+
+To replay the spend from scratch, delete `.demo-state.json` **and** start from a fresh customer (or nuke the sandbox with `npx atmn nuke`). Do not delete the state file on its own against a customer who has already spent: the state file is the duplicate protection, and without it the spend is tracked — and deducted — a second time.
 
 If the demo customer has no payment method, the Pro upgrade cannot complete: `billing.attach` returns a **payment URL** instead of an invoice. The script prints it — open it, pay with a Stripe test card (e.g. `4242 4242 4242 4242`), then run the script again; it picks up at the upgrade instead of starting over.
 
@@ -87,7 +89,7 @@ If the demo customer has no payment method, the Pro upgrade cannot complete: `bi
 - **`Scenario failed: ... Status 401`** — the key in `.env` is wrong, or belongs to a different environment. The scenario expects a sandbox secret key (`am_sk_test_...`) for the same organisation you pushed the config to.
 - **`no credit balance found`** — the config was not pushed yet (`npx atmn push`), or the demo customer was created before the push and never got a plan. Push first, then re-run; or nuke the sandbox (`npx atmn nuke`) and start clean.
 - **Balance doesn't show rollovers** — rollovers only exist after a real cycle reset. Check the `resets at` date the script prints; before that date there is nothing to see.
-- **A warning that the key doesn't look like a test key** — you are about to run the upgrade against a live organisation. Stop and use a sandbox key.
+- **`AUTUMN_SECRET_KEY is not a sandbox (test-mode) key`** — the scenario refuses non-test keys, because the plan upgrade charges real money against a live organisation. Use a sandbox key (`am_sk_test_...`); only if you deliberately want a live run, set `AUTUMN_ALLOW_LIVE_KEY=1`.
 
 ## What is verified
 

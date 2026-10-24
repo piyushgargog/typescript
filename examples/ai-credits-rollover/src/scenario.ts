@@ -18,19 +18,27 @@
  *   2. `cp .env.example .env`     — add your sandbox secret key
  *   3. `npm run scenario`
  *
- * No real money moves: use a sandbox (test-mode) key throughout. If the
- * demo customer has no payment method, the Pro upgrade in step 4 returns a
- * payment URL instead of completing — open it, pay with a Stripe test
- * card, then run this script again.
+ * No real money moves: use a sandbox (test-mode) key throughout. The
+ * script refuses to run against a non-test key unless you explicitly
+ * opt in with AUTUMN_ALLOW_LIVE_KEY=1. If the demo customer has no
+ * payment method, the Pro upgrade in step 4 returns a payment URL
+ * instead of completing — open it, pay with a Stripe test card, then
+ * run this script again.
  *
  * The script is safe to re-run. `track` has no idempotency key — a second
- * identical call deducts twice — so before every mutating step the script
- * reads the customer's current state and skips work that is already done.
- * That guard is application-level logic on purpose: duplicate protection
- * is your code's job, not the billing provider's.
+ * identical call deducts twice — so each completed `track` step is
+ * recorded in a local state file (.demo-state.json, gitignored) and
+ * skipped on later runs; the plan steps are guarded by the customer's
+ * live state instead. Those guards are application-level logic on
+ * purpose: duplicate protection is your code's job, not the billing
+ * provider's.
  */
 
+import { readFileSync, writeFileSync } from "node:fs";
+
 import { Autumn } from "autumn-js";
+
+import { credits as creditsFeature, pro, starter } from "../autumn.config.js";
 
 const secretKey = process.env.AUTUMN_SECRET_KEY;
 
@@ -50,11 +58,31 @@ if (!secretKey) {
 	process.exit(1);
 }
 
-if (!secretKey.includes("_test")) {
+// Autumn keys encode their environment in the key itself: am_sk_test_...
+// is a sandbox key, am_sk_live_... is production — the same split atmn's
+// own isSandboxKey() makes. Step 4 charges for a plan upgrade, so a
+// non-test key is refused by default; running against a live organisation
+// takes an explicit opt-in.
+const keyEnvironment = secretKey.split("am_sk_")[1]?.split("_")[0];
+if (keyEnvironment !== "test") {
+	if (process.env.AUTUMN_ALLOW_LIVE_KEY !== "1") {
+		console.error(
+			[
+				"AUTUMN_SECRET_KEY is not a sandbox (test-mode) key.",
+				"",
+				"This example attaches a paid plan and records usage, so it",
+				"refuses to run against a live organisation. Use a sandbox",
+				"key (am_sk_test_...), or — only if you really mean it —",
+				"opt in explicitly:",
+				"",
+				"  AUTUMN_ALLOW_LIVE_KEY=1 npm run scenario",
+			].join("\n"),
+		);
+		process.exit(1);
+	}
 	console.warn(
-		"Warning: AUTUMN_SECRET_KEY does not look like a test-mode key " +
-			"(expected am_sk_test_...). This example charges a real plan " +
-			"upgrade — use a sandbox key.",
+		"WARNING: running with a non-sandbox key because " +
+			"AUTUMN_ALLOW_LIVE_KEY=1 is set. Real charges will occur.",
 	);
 }
 
@@ -71,8 +99,68 @@ const PREMIUM_MODEL = "premium_model";
 const SPEND_BASIC = 40;
 const SPEND_PREMIUM = 6;
 
-// Rollover caps from autumn.config.ts, per plan.
-const ROLLOVER_CAP: Record<string, number> = { [STARTER]: 100, [PRO]: 500 };
+// Billing terms are read from autumn.config.ts, never restated here, so
+// this script cannot silently drift from the config it narrates. (The
+// atmn builders may emit camelCase or snake_case keys — accept either,
+// as scripts/verify-config.ts does.)
+function pickField(obj: any, ...keys: string[]): any {
+	for (const key of keys) {
+		if (obj && obj[key] !== undefined) return obj[key];
+	}
+	return undefined;
+}
+
+function creditCostOf(featureId: string): number {
+	const schema =
+		pickField(creditsFeature, "creditSchema", "credit_schema") ?? [];
+	const entry = schema.find(
+		(e: any) =>
+			pickField(e, "meteredFeatureId", "metered_feature_id") ===
+			featureId,
+	);
+	return pickField(entry, "creditCost", "credit_cost") ?? 0;
+}
+
+const BASIC_CREDIT_COST = creditCostOf(BASIC_MODEL);
+const PREMIUM_CREDIT_COST = creditCostOf(PREMIUM_MODEL);
+
+function rolloverOf(plan: any) {
+	const itemDef = (plan?.items ?? []).find(
+		(it: any) => pickField(it, "featureId", "feature_id") === CREDITS,
+	);
+	return itemDef ? pickField(itemDef, "rollover") : undefined;
+}
+
+const PLANS: Record<string, any> = { [STARTER]: starter, [PRO]: pro };
+const ROLLOVER_CAP: Record<string, number> = {
+	[STARTER]: rolloverOf(starter)?.max ?? 0,
+	[PRO]: rolloverOf(pro)?.max ?? 0,
+};
+
+// ── Local completion state ────────────────────────────────────────────────
+// Balance `usage` is scoped to the current billing cycle, so it cannot
+// say whether the demo spend already happened in an earlier cycle. Each
+// completed `track` step is therefore recorded in a small state file
+// (gitignored) and consulted before tracking again.
+const STATE_URL = new URL("../.demo-state.json", import.meta.url);
+
+type DemoState = { customers: Record<string, Record<string, number>> };
+
+function loadState(): DemoState {
+	try {
+		const parsed = JSON.parse(readFileSync(STATE_URL, "utf8"));
+		if (parsed && typeof parsed === "object" && parsed.customers) {
+			return parsed as DemoState;
+		}
+	} catch {
+		// Missing or unreadable state file — start empty.
+	}
+	return { customers: {} };
+}
+
+function saveState(state: DemoState) {
+	writeFileSync(STATE_URL, `${JSON.stringify(state, null, 2)}\n`);
+}
 
 function heading(step: string, title: string) {
 	console.log(`\n── Step ${step}: ${title}`);
@@ -147,43 +235,105 @@ async function main() {
 		"2",
 		`Spend credits: ${SPEND_BASIC} basic requests + ${SPEND_PREMIUM} premium requests`,
 	);
-	const usageSoFar = customer.balances?.[CREDITS]?.usage ?? 0;
-	if (usageSoFar > 0) {
-		// Re-run protection. `track` calls are not idempotent — without this
-		// guard, running the script twice would deduct the demo spend twice.
+	const state = loadState();
+	const steps = (state.customers[CUSTOMER_ID] ??= {});
+	const basicStep = `track:${BASIC_MODEL}`;
+	const premiumStep = `track:${PREMIUM_MODEL}`;
+
+	// First run against this customer: adopt any usage the current cycle
+	// already shows (e.g. from a run that pre-dates the state file) so it
+	// is not tracked twice. The spend lands basic-first, so the cycle's
+	// usage attributes unambiguously up to the full demo spend.
+	if (steps[basicStep] === undefined && steps[premiumStep] === undefined) {
+		const cycleUsage = customer.balances?.[CREDITS]?.usage ?? 0;
+		if (cycleUsage > 0) {
+			const basicDone = Math.min(
+				SPEND_BASIC,
+				Math.floor(
+					Math.min(cycleUsage, SPEND_BASIC * BASIC_CREDIT_COST) /
+						BASIC_CREDIT_COST,
+				),
+			);
+			const premiumCredits =
+				cycleUsage - basicDone * BASIC_CREDIT_COST;
+			const premiumDone =
+				premiumCredits % PREMIUM_CREDIT_COST === 0
+					? Math.min(SPEND_PREMIUM, premiumCredits / PREMIUM_CREDIT_COST)
+					: 0;
+			if (basicDone > 0) steps[basicStep] = basicDone;
+			if (premiumDone > 0) steps[premiumStep] = premiumDone;
+			if (basicDone > 0 || premiumDone > 0) {
+				saveState(state);
+				console.log(
+					`  adopted ${cycleUsage} credits of existing usage into .demo-state.json — it will not be tracked again`,
+				);
+			}
+		}
+	}
+
+	const basicRemaining = SPEND_BASIC - (steps[basicStep] ?? 0);
+	const premiumRemaining = SPEND_PREMIUM - (steps[premiumStep] ?? 0);
+
+	if (basicRemaining <= 0 && premiumRemaining <= 0) {
 		console.log(
-			`  ${usageSoFar} credits already used — skipping the spend so a re-run does not double-count`,
+			"  demo spend already tracked in an earlier run (recorded in .demo-state.json) — skipping",
 		);
 	} else {
 		// Gate first, then track. You always pass the *underlying* feature;
 		// Autumn converts the usage to credits (the check response's
-		// `balances` map includes the linked credit system).
+		// `balances` map includes the linked credit system). If the gate
+		// denies the spend, nothing is tracked and nothing is recorded —
+		// fix the cause and re-run.
+		const gateFeature = premiumRemaining > 0 ? PREMIUM_MODEL : BASIC_MODEL;
+		const gateAmount =
+			premiumRemaining > 0 ? premiumRemaining : basicRemaining;
 		const gate = await autumn.check({
 			customerId: CUSTOMER_ID,
-			featureId: PREMIUM_MODEL,
-			requiredBalance: SPEND_PREMIUM, // can this customer afford 6 premium requests?
+			featureId: gateFeature,
+			requiredBalance: gateAmount, // can this customer afford the remaining spend?
 		});
 		console.log(
-			`  check premium_model x${SPEND_PREMIUM} → allowed: ${gate.allowed}`,
+			`  check ${gateFeature} x${gateAmount} → allowed: ${gate.allowed}`,
 		);
 
-		// `async: false` applies the usage before responding, so the printed
-		// balances below are already up to date.
-		await autumn.track({
-			customerId: CUSTOMER_ID,
-			featureId: BASIC_MODEL,
-			value: SPEND_BASIC,
-			async: false,
-		});
-		await autumn.track({
-			customerId: CUSTOMER_ID,
-			featureId: PREMIUM_MODEL,
-			value: SPEND_PREMIUM,
-			async: false,
-		});
-		console.log(
-			`  tracked ${SPEND_BASIC} basic (${SPEND_BASIC} credits) + ${SPEND_PREMIUM} premium (${SPEND_PREMIUM * 10} credits)`,
-		);
+		if (!gate.allowed) {
+			console.log(
+				"  check denied the spend — skipping the track calls, so no usage is recorded against a denied gate",
+			);
+		} else {
+			// `async: false` applies the usage before responding, so the
+			// balances printed below are already up to date. Each step is
+			// recorded as soon as it lands, so a run that stops halfway
+			// resumes with only the remainder.
+			const tracked: string[] = [];
+			if (basicRemaining > 0) {
+				await autumn.track({
+					customerId: CUSTOMER_ID,
+					featureId: BASIC_MODEL,
+					value: basicRemaining,
+					async: false,
+				});
+				steps[basicStep] = SPEND_BASIC;
+				saveState(state);
+				tracked.push(
+					`${basicRemaining} basic (${basicRemaining * BASIC_CREDIT_COST} credits)`,
+				);
+			}
+			if (premiumRemaining > 0) {
+				await autumn.track({
+					customerId: CUSTOMER_ID,
+					featureId: PREMIUM_MODEL,
+					value: premiumRemaining,
+					async: false,
+				});
+				steps[premiumStep] = SPEND_PREMIUM;
+				saveState(state);
+				tracked.push(
+					`${premiumRemaining} premium (${premiumRemaining * PREMIUM_CREDIT_COST} credits)`,
+				);
+			}
+			console.log(`  tracked ${tracked.join(" + ")}`);
+		}
 	}
 	customer = await autumn.customers.get({ customerId: CUSTOMER_ID });
 	printCreditBalance("after usage", customer);
@@ -193,13 +343,20 @@ async function main() {
 	const balanceNow = customer.balances?.[CREDITS];
 	const planNow = currentPlanIds(customer)[0] ?? STARTER;
 	const cap = ROLLOVER_CAP[planNow] ?? 0;
+	const rolloverNow = rolloverOf(PLANS[planNow]);
+	const expiryLength = rolloverNow
+		? pickField(rolloverNow, "expiryDurationLength", "expiry_duration_length")
+		: undefined;
+	const expiryType = rolloverNow
+		? pickField(rolloverNow, "expiryDurationType", "expiry_duration_type")
+		: undefined;
 	if (balanceNow) {
 		console.log(
 			[
 				"  Nothing to call here: rollover is configured on the plan item",
-				"  (see autumn.config.ts — Starter rolls over up to 100 unused",
-				"  credits, Pro up to 500; rolled-over credits expire after",
-				"  1 month). When the cycle resets, Autumn grants the new",
+				`  (see autumn.config.ts — ${STARTER} rolls over up to ${ROLLOVER_CAP[STARTER]} unused`,
+				`  credits, ${PRO} up to ${ROLLOVER_CAP[PRO]}; rolled-over credits expire after`,
+				`  ${expiryLength} ${expiryType}${expiryLength === 1 ? "" : "s"}). When the cycle resets, Autumn grants the new`,
 				"  cycle's credits and carries the unused amount over as a",
 				"  separate rollover balance instead of deleting it.",
 				"",
@@ -209,7 +366,8 @@ async function main() {
 				"",
 				"  A script cannot fast-forward a billing cycle, so this step",
 				"  only reads the live balance. Re-run this script after the",
-				"  reset date printed as `resets at`, and the balance will show",
+				"  reset date printed as `resets at` — the spend is recorded",
+				"  locally and will not repeat — and the balance will show",
 				"  a `rollovers` breakdown with the carried-over amount.",
 			].join("\n"),
 		);
@@ -271,8 +429,8 @@ async function main() {
 			"     attach/check/track never change.",
 			"",
 			"What Autumn did: metering conversion, the rollover at reset,",
-			"the plan swap. What this script did: gating, tracking — and the",
-			"re-run guards, because `track` has no idempotency key.",
+			"the plan swap. What this script did: gating, tracking — and",
+			"the local completion state, because `track` has no idempotency key.",
 		].join("\n"),
 	);
 }

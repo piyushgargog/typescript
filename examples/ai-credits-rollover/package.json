@@ -4,7 +4,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"scenario": "tsx src/scenario.ts",
+		"scenario": "tsx --env-file-if-exists=.env src/scenario.ts",
 		"typecheck": "tsc --noEmit",
 		"verify:config": "tsx scripts/verify-config.ts"
 	},
